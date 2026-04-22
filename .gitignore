@@ -1,2 +1,11 @@
-.~lock.ES 363 - Final Project.docx#
-.DS_Store  
+.~lock.*
+.DS_Store
+# Report files — tracked locally but not in version control
+*.docx
+*.pptx
+# Generated outputs — run the script locally to produce these
+outputs/
+cache/
+__pycache__/
+*.pyc
+.env
