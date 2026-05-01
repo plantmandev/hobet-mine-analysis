@@ -2,22 +2,25 @@
 """
 generate_tiles.py
 
-Read cached NDVI/NBR arrays from cache/ and write XYZ PNG tiles to
-site/public/tiles/.  No network calls — reads only local .npy files.
+Read cached NDVI/NBR arrays from cache/<mine-slug>/ and write XYZ PNG tiles to
+site/public/tiles/<mine-slug>/.  No network calls — reads only local .npy files.
 
 Outputs
 -------
-  site/public/tiles/ndvi/{year}/{z}/{x}/{y}.png
-  site/public/tiles/nbr/{year}/{z}/{x}/{y}.png
-  site/public/tiles/manifest.json   ← bounds, years, zoom_levels
-  site/public/tiles/stats.json      ← per-year mean NDVI/NBR/pct_valid
+  site/public/tiles/<mine-slug>/ndvi/{year}/{z}/{x}/{y}.png
+  site/public/tiles/<mine-slug>/nbr/{year}/{z}/{x}/{y}.png
+  site/public/tiles/<mine-slug>/manifest.json   ← bounds, years, zoom_levels
 
 Usage
 -----
-  python generate_tiles.py
+  python generate_tiles.py --mine hobet-mine
+  python generate_tiles.py --mine "Hobet Mine"
 """
 
+import argparse
+import csv
 import json
+import re
 import warnings
 from pathlib import Path
 
@@ -34,25 +37,18 @@ from rasterio.warp import reproject
 from tqdm import tqdm
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-HERE      = Path(__file__).parent
-CACHE_DIR = HERE / "cache"
-SITE_DIR  = HERE / "site" / "public" / "tiles"
+HERE         = Path(__file__).parent
+CACHE_DIR    = HERE / "cache"
+METADATA_CSV = HERE / "mine-metadata.csv"
 
-# ── Study area (Hobet Mine, WV — WRS-2 path 19, row 34) ──────────────────────
-BOUNDS = (-82.10, 37.85, -81.60, 38.15)   # west, south, east, north
-
-OUT_RES       = 0.00027                   # ~30 m in EPSG:4326
-OUT_WIDTH     = int(round((BOUNDS[2] - BOUNDS[0]) / OUT_RES))
-OUT_HEIGHT    = int(round((BOUNDS[3] - BOUNDS[1]) / OUT_RES))
-OUT_TRANSFORM = from_bounds(*BOUNDS, OUT_WIDTH, OUT_HEIGHT)
-OUT_CRS       = CRS.from_epsg(4326)
-EPSG3857      = CRS.from_epsg(3857)
-
-# ── Tile settings ─────────────────────────────────────────────────────────────
+# ── Tile / grid settings ──────────────────────────────────────────────────────
 TILE_ZOOMS = [9, 10, 11, 12]
 TILE_SIZE  = 256
+OUT_RES    = 0.00027   # ~30 m in EPSG:4326
+OUT_CRS    = CRS.from_epsg(4326)
+EPSG3857   = CRS.from_epsg(3857)
 
-# ── Colormaps (match hobet_ndvi_timeseries.py) ────────────────────────────────
+# ── Colormaps (match mine_reclamation_timeseries.py) ─────────────────────────
 NDVI_CMAP = mcolors.LinearSegmentedColormap.from_list(
     "ndvi",
     [(0.0, "#8B5E3C"), (0.2, "#C8A96E"), (0.4, "#FFFFCC"),
@@ -68,9 +64,28 @@ NDVI_VMIN, NDVI_VMAX = -0.1, 0.8
 NBR_VMIN,  NBR_VMAX  = -0.3, 0.8
 
 
+# ── Mine metadata ─────────────────────────────────────────────────────────────
+
+def mine_slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def load_mines(csv_path: Path) -> dict:
+    mines = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            mines[mine_slug(row["mine_name"])] = row
+    return mines
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def render_tile(array: np.ndarray, tile: mercantile.Tile) -> np.ndarray:
+def render_tile(
+    array: np.ndarray,
+    tile: mercantile.Tile,
+    out_transform,
+    out_crs,
+) -> np.ndarray:
     """Reproject a EPSG:4326 float32 array into a 256×256 Web Mercator tile."""
     tb  = mercantile.xy_bounds(tile)
     dst = np.full((TILE_SIZE, TILE_SIZE), np.nan, dtype=np.float32)
@@ -82,8 +97,8 @@ def render_tile(array: np.ndarray, tile: mercantile.Tile) -> np.ndarray:
         reproject(
             source=array,
             destination=dst,
-            src_transform=OUT_TRANSFORM,
-            src_crs=OUT_CRS,
+            src_transform=out_transform,
+            src_crs=out_crs,
             dst_transform=dst_transform,
             dst_crs=EPSG3857,
             resampling=Resampling.bilinear,
@@ -93,14 +108,8 @@ def render_tile(array: np.ndarray, tile: mercantile.Tile) -> np.ndarray:
     return dst
 
 
-def save_tile_png(
-    array: np.ndarray,
-    cmap,
-    vmin: float,
-    vmax: float,
-    path: Path,
-) -> bool:
-    """Colormap array → RGBA PNG.  Returns False and skips if all pixels are NaN."""
+def save_tile_png(array: np.ndarray, cmap, vmin: float, vmax: float, path: Path) -> bool:
+    """Colormap array → RGBA PNG. Returns False and skips if all pixels are NaN."""
     if np.all(np.isnan(array)):
         return False
     norm    = mcolors.Normalize(vmin=vmin, vmax=vmax, clip=True)
@@ -114,49 +123,62 @@ def save_tile_png(
     return True
 
 
-def year_stats(ndvi: np.ndarray, nbr: np.ndarray | None) -> dict:
-    v_ndvi = ndvi[~np.isnan(ndvi)]
-    result: dict = {
-        "mean_ndvi":  round(float(np.mean(v_ndvi)),   4) if len(v_ndvi) else None,
-        "std_ndvi":   round(float(np.std(v_ndvi)),    4) if len(v_ndvi) else None,
-        "pct_valid":  round(100 * len(v_ndvi) / ndvi.size, 2),
-        "mean_nbr":   None,
-    }
-    if nbr is not None:
-        v_nbr = nbr[~np.isnan(nbr)]
-        result["mean_nbr"] = round(float(np.mean(v_nbr)), 4) if len(v_nbr) else None
-    return result
-
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    SITE_DIR.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Generate XYZ map tiles from cached NDVI/NBR arrays."
+    )
+    parser.add_argument(
+        "--mine", required=True, metavar="NAME_OR_SLUG",
+        help="Mine slug or name to tile (see mine-metadata.csv)",
+    )
+    args = parser.parse_args()
 
-    # Years that actually have NDVI cache files
+    mines = load_mines(METADATA_CSV)
+    slug  = mine_slug(args.mine)
+    if slug not in mines:
+        raise SystemExit(
+            f"Mine '{args.mine}' not found. Available: {', '.join(mines)}"
+        )
+
+    mine   = mines[slug]
+    bounds = (
+        float(mine["bounds_west"]),
+        float(mine["bounds_south"]),
+        float(mine["bounds_east"]),
+        float(mine["bounds_north"]),
+    )
+    out_width     = int(round((bounds[2] - bounds[0]) / OUT_RES))
+    out_height    = int(round((bounds[3] - bounds[1]) / OUT_RES))
+    out_transform = from_bounds(*bounds, out_width, out_height)
+
+    cache_dir = CACHE_DIR / slug
+    site_dir  = HERE / "site" / "public" / "tiles" / slug
+    site_dir.mkdir(parents=True, exist_ok=True)
+
     ndvi_years = sorted(
-        int(p.stem.split("_")[1]) for p in CACHE_DIR.glob("ndvi_*.npy")
+        int(p.stem.split("_")[1]) for p in cache_dir.glob("ndvi_*.npy")
     )
     if not ndvi_years:
-        raise SystemExit(f"No ndvi_*.npy files found in {CACHE_DIR}")
+        raise SystemExit(f"No ndvi_*.npy files found in {cache_dir}")
 
-    tile_list = list(mercantile.tiles(*BOUNDS, zooms=TILE_ZOOMS))
+    tile_list = list(mercantile.tiles(*bounds, zooms=TILE_ZOOMS))
+    print(f"Mine:           {mine['mine_name']}")
     print(f"Tiles per year: {len(tile_list)} across zooms {TILE_ZOOMS}")
     print(f"Years with NDVI cache: {len(ndvi_years)}  ({ndvi_years[0]}–{ndvi_years[-1]})")
-    print(f"Output → {SITE_DIR}\n")
+    print(f"Output → {site_dir}\n")
 
-    stats: dict           = {}
-    manifest_years: list  = []
+    manifest_years: list = []
 
     for year in tqdm(ndvi_years, desc="Years"):
-        ndvi_path = CACHE_DIR / f"ndvi_{year}.npy"
-        nbr_path  = CACHE_DIR / f"nbr_{year}.npy"
+        ndvi_path = cache_dir / f"ndvi_{year}.npy"
+        nbr_path  = cache_dir / f"nbr_{year}.npy"
 
         ndvi = np.load(ndvi_path)
         nbr  = np.load(nbr_path) if nbr_path.exists() else None
 
         manifest_years.append(year)
-        stats[str(year)] = year_stats(ndvi, nbr)
 
         bands = [("ndvi", ndvi, NDVI_CMAP, NDVI_VMIN, NDVI_VMAX)]
         if nbr is not None:
@@ -166,33 +188,29 @@ def main() -> None:
         for tile in tile_list:
             for name, array, cmap, vmin, vmax in bands:
                 out = (
-                    SITE_DIR / name / str(year) /
+                    site_dir / name / str(year) /
                     str(tile.z) / str(tile.x) / f"{tile.y}.png"
                 )
                 if out.exists():
                     continue
-                data = render_tile(array, tile)
+                data = render_tile(array, tile, out_transform, OUT_CRS)
                 if save_tile_png(data, cmap, vmin, vmax, out):
                     saved += 1
 
         tqdm.write(f"  {year}: {saved} tiles written")
 
-    # ── Manifests ─────────────────────────────────────────────────────────────
     manifest = {
-        "bounds":      list(BOUNDS),
+        "mine":        mine["mine_name"],
+        "bounds":      list(bounds),
         "years":       manifest_years,
         "zoom_levels": TILE_ZOOMS,
     }
-    (SITE_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    (SITE_DIR / "stats.json").write_text(json.dumps(stats, indent=2))
+    (site_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    total_tiles = sum(
-        1 for p in SITE_DIR.rglob("*.png")
-    )
+    total_tiles = sum(1 for _ in site_dir.rglob("*.png"))
     print(f"\nDone — {len(manifest_years)} years, {total_tiles} tiles total")
-    print("Copy site/ contents into your Next.js project root:")
-    print("  site/public/tiles/  →  <your-site>/public/tiles/")
-    print("  site/hobet-mine-analysis/  →  <your-site>/app/hobet-mine-analysis/")
+    print(f"Copy to your Next.js project:")
+    print(f"  {site_dir}  →  <your-site>/public/tiles/{slug}/")
 
 
 if __name__ == "__main__":

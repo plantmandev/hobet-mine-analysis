@@ -9,7 +9,7 @@
 //
 // SETUP REQUIRED:
 //   Before running, draw a polygon geometry in the GEE map panel and name it "geometry2".
-//   This defines the Hobet Mine study area boundary (Lincoln/Boone Co., WV).
+//   This defines the mine reclamation study area boundary (Hobet Mine, Lincoln/Boone Co., WV).
 //   Approximate bounds: lon -82.1 to -81.6, lat 37.85 to 38.15
 //=============================================================================================================================//
 
@@ -99,11 +99,13 @@ var bounds = studyAreaFC.style({ color: "red", fillColor: "00000000" });
 Map.addLayer(bounds, {}, "Study Area", true);
 
 // Cloud and shadow mask using QA_PIXEL band
+// QA_PIXEL bits: 3=cloud (8), 4=cloud shadow (16), 5=snow (32)
 function maskCloud(image) {
   var qa = image.select("QA_PIXEL");
-  var mask = qa.bitwiseAnd(8).eq(0)   // cloud shadow
-              .and(qa.bitwiseAnd(32).eq(0)); // cloud
-  return image.mask(mask);
+  var mask = qa.bitwiseAnd(8).eq(0)    // cloud
+              .and(qa.bitwiseAnd(16).eq(0))  // cloud shadow
+              .and(qa.bitwiseAnd(32).eq(0)); // snow
+  return image.updateMask(mask);
 }
 
 // Apply cloud masking

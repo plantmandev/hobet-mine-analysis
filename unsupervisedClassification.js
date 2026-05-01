@@ -67,9 +67,13 @@ if (filtered.size().getInfo() === 0) {
 }
 
 // Apply QA_PIXEL cloud mask before classification
+// QA_PIXEL bits: 3=cloud (8), 4=cloud shadow (16), 5=snow (32)
 function maskCloudSingle(image) {
   var qa = image.select("QA_PIXEL");
-  return image.mask(qa.bitwiseAnd(8).eq(0).and(qa.bitwiseAnd(32).eq(0)));
+  var mask = qa.bitwiseAnd(8).eq(0)    // cloud
+              .and(qa.bitwiseAnd(16).eq(0))  // cloud shadow
+              .and(qa.bitwiseAnd(32).eq(0)); // snow
+  return image.updateMask(mask);
 }
 var filteredImg = ee.Image(filtered.map(maskCloudSingle).first()).select(bands);
 
