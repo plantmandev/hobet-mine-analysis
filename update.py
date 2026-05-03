@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -59,6 +60,28 @@ CREATE TABLE IF NOT EXISTS mine_images (
     height_px    INT              NOT NULL,
     updated_at   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     UNIQUE (mine_id, year, index_type)
+);
+
+CREATE TABLE IF NOT EXISTS mine_timeseries (
+    id                    SERIAL PRIMARY KEY,
+    mine_id               INT              NOT NULL REFERENCES mines(id) ON DELETE CASCADE,
+    year                  INT              NOT NULL,
+    ndvi_mean             DOUBLE PRECISION,
+    ndvi_median           DOUBLE PRECISION,
+    ndvi_std              DOUBLE PRECISION,
+    ndvi_p25              DOUBLE PRECISION,
+    ndvi_p75              DOUBLE PRECISION,
+    ndvi_valid_px         INT,
+    ndvi_pct_above_threshold DOUBLE PRECISION,
+    nbr_mean              DOUBLE PRECISION,
+    nbr_median            DOUBLE PRECISION,
+    nbr_std               DOUBLE PRECISION,
+    nbr_p25               DOUBLE PRECISION,
+    nbr_p75               DOUBLE PRECISION,
+    nbr_valid_px          INT,
+    nbr_pct_above_threshold  DOUBLE PRECISION,
+    updated_at            TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    UNIQUE (mine_id, year)
 );
 
 -- Flat view: one row per image with all mine metadata alongside it.
@@ -229,6 +252,79 @@ def upload_images(conn, slug_to_id: dict, selected_slug: str | None = None) -> N
             conn.commit()
 
 
+def upload_timeseries(conn, slug_to_id: dict, selected_slug: str | None = None) -> None:
+    slugs = [selected_slug] if selected_slug else list(slug_to_id.keys())
+
+    for slug in slugs:
+        mine_id = slug_to_id.get(slug)
+        if mine_id is None:
+            continue
+
+        ts_path = OUTPUT_DIR / slug / "timeseries.json"
+        if not ts_path.exists():
+            print(f"  {slug}: no timeseries.json, skipping")
+            continue
+
+        with open(ts_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        series = data.get("series", [])
+        if not series:
+            print(f"  {slug}: timeseries.json has no series data")
+            continue
+
+        print(f"  {slug}: uploading {len(series)} timeseries rows")
+        with conn.cursor() as cur:
+            for row in series:
+                cur.execute(
+                    """
+                    INSERT INTO mine_timeseries (
+                        mine_id, year,
+                        ndvi_mean, ndvi_median, ndvi_std, ndvi_p25, ndvi_p75,
+                        ndvi_valid_px, ndvi_pct_above_threshold,
+                        nbr_mean, nbr_median, nbr_std, nbr_p25, nbr_p75,
+                        nbr_valid_px, nbr_pct_above_threshold,
+                        updated_at
+                    ) VALUES (
+                        %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s,
+                        NOW()
+                    )
+                    ON CONFLICT (mine_id, year) DO UPDATE SET
+                        ndvi_mean                = EXCLUDED.ndvi_mean,
+                        ndvi_median              = EXCLUDED.ndvi_median,
+                        ndvi_std                 = EXCLUDED.ndvi_std,
+                        ndvi_p25                 = EXCLUDED.ndvi_p25,
+                        ndvi_p75                 = EXCLUDED.ndvi_p75,
+                        ndvi_valid_px            = EXCLUDED.ndvi_valid_px,
+                        ndvi_pct_above_threshold = EXCLUDED.ndvi_pct_above_threshold,
+                        nbr_mean                 = EXCLUDED.nbr_mean,
+                        nbr_median               = EXCLUDED.nbr_median,
+                        nbr_std                  = EXCLUDED.nbr_std,
+                        nbr_p25                  = EXCLUDED.nbr_p25,
+                        nbr_p75                  = EXCLUDED.nbr_p75,
+                        nbr_valid_px             = EXCLUDED.nbr_valid_px,
+                        nbr_pct_above_threshold  = EXCLUDED.nbr_pct_above_threshold,
+                        updated_at               = NOW()
+                    """,
+                    (
+                        mine_id, row["year"],
+                        row.get("ndvi_mean"),    row.get("ndvi_median"),
+                        row.get("ndvi_std"),     row.get("ndvi_p25"),
+                        row.get("ndvi_p75"),     row.get("ndvi_valid_px"),
+                        row.get("ndvi_pct_above_threshold"),
+                        row.get("nbr_mean"),     row.get("nbr_median"),
+                        row.get("nbr_std"),      row.get("nbr_p25"),
+                        row.get("nbr_p75"),      row.get("nbr_valid_px"),
+                        row.get("nbr_pct_above_threshold"),
+                    ),
+                )
+        conn.commit()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -272,6 +368,7 @@ def main() -> None:
         slug_to_id = upsert_mines(conn, mines)
 
         upload_images(conn, slug_to_id, selected_slug=args.mine)
+        upload_timeseries(conn, slug_to_id, selected_slug=args.mine)
         print("\nDone.")
     finally:
         conn.close()

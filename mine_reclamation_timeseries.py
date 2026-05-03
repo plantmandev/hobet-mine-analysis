@@ -27,6 +27,7 @@ Install:
 import argparse
 import calendar
 import csv
+import json
 import logging
 import os
 import re
@@ -254,6 +255,59 @@ def compute_indices(
     return ndvi.astype(np.float32), nbr.astype(np.float32)
 
 
+# ── Statistics ────────────────────────────────────────────────────────────────
+
+NDVI_VEG_THRESHOLD = 0.4   # NDVI ≥ this → dense vegetation
+NBR_RECOVERY_THRESHOLD = 0.3  # NBR ≥ this → recovered / low-disturbance
+
+
+def _array_stats(arr: np.ndarray, threshold: float) -> dict | None:
+    valid = arr[~np.isnan(arr)]
+    if len(valid) == 0:
+        return None
+    return {
+        "mean":              round(float(np.mean(valid)),              4),
+        "median":            round(float(np.median(valid)),            4),
+        "std":               round(float(np.std(valid)),               4),
+        "p25":               round(float(np.percentile(valid, 25)),    4),
+        "p75":               round(float(np.percentile(valid, 75)),    4),
+        "valid_px":          int(len(valid)),
+        "pct_above_threshold": round(float((valid >= threshold).mean()), 4),
+    }
+
+
+def write_timeseries_json(slug: str, mine: dict, cache_dir: Path, output_dir: Path) -> None:
+    """Build per-year stats from cached .npy arrays and write outputs/<slug>/timeseries.json."""
+    series = []
+    for year in YEARS:
+        ndvi_path = cache_dir / f"ndvi_{year}.npy"
+        nbr_path  = cache_dir / f"nbr_{year}.npy"
+        if not ndvi_path.exists() or not nbr_path.exists():
+            continue
+        ndvi_stats = _array_stats(np.load(ndvi_path), NDVI_VEG_THRESHOLD)
+        nbr_stats  = _array_stats(np.load(nbr_path),  NBR_RECOVERY_THRESHOLD)
+        if ndvi_stats is None:
+            continue
+        entry: dict = {"year": year}
+        for k, v in ndvi_stats.items():
+            entry[f"ndvi_{k}"] = v
+        if nbr_stats:
+            for k, v in nbr_stats.items():
+                entry[f"nbr_{k}"] = v
+        series.append(entry)
+
+    payload = {
+        "slug":      slug,
+        "mine_name": mine["mine_name"],
+        "series":    series,
+    }
+    out_path = output_dir / slug / "timeseries.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    tqdm.write(f"  → timeseries.json  ({len(series)} years)")
+
+
 # ── Output writers ────────────────────────────────────────────────────────────
 
 def _colormap_png(array: np.ndarray, cmap, vmin: float, vmax: float, path: Path) -> None:
@@ -472,6 +526,7 @@ def main() -> None:
                 + (f"  [{', '.join(sorted(set(platforms)))}]" if platforms else "")
             )
 
+        write_timeseries_json(slug, mine, cache_dir, OUTPUT_DIR)
         print(f"   → outputs/{slug}/")
 
 
