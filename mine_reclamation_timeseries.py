@@ -28,11 +28,20 @@ import argparse
 import calendar
 import csv
 import logging
+import os
 import re
+import time
 import warnings
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# Tell GDAL not to probe for .aux/.hdr sidecar files alongside COG assets.
+# Without this, rasterio appends sidecar suffixes to the signed Azure URL which
+# corrupts the SAS signature and produces a flood of 403/409 warnings.
+os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "0")   # let our own _retry handle it
+os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", "0")  # no stale-response cache
 
 import numpy as np
 import matplotlib
@@ -51,6 +60,34 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
+
+_FATAL_ERRS = (
+    "HTTP response code: 403",          # bad/expired signed URL — same URL won't recover
+    "HTTP response code: 404",          # asset missing from storage
+    "not recognized as being in a supported file format",  # GDAL got an error body instead of TIF
+)
+
+
+def _retry(fn, *, attempts=5, base_delay=15.0):
+    """Call fn(), retrying with exponential backoff on transient exceptions.
+
+    Errors that won't recover with the same URL (403, 404, format errors) are
+    re-raised immediately so the caller can skip the scene rather than waiting
+    through a full backoff cycle.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            msg = str(exc)
+            if any(s in msg for s in _FATAL_ERRS):
+                raise  # permanent error — retrying won't help
+            if attempt == attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            log.warning("Attempt %d/%d failed (%s); retrying in %.0fs", attempt + 1, attempts, exc, delay)
+            time.sleep(delay)
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 HERE         = Path(__file__).parent
 OUTPUT_DIR   = HERE / "outputs"
@@ -62,12 +99,12 @@ OUT_RES = 0.00027
 
 # ── Processing parameters ─────────────────────────────────────────────────────
 YEARS          = list(range(1985, 2026))
-CLOUD_THRESH   = 20    # scene-level pre-filter: skip scenes >20% cloudy (full footprint)
-AOI_CLEAR_THRESH = 0.50  # per-AOI QA pre-screen: skip scenes where <50% of study area is clear
+CLOUD_THRESH   = 80    # scene-level pre-filter: coarse pre-filter; AOI check below is authoritative
+AOI_CLEAR_THRESH = 0.20  # per-AOI QA pre-screen: accept scenes with ≥20% of study area clear
 MAX_SCENES     = 40    # max scenes per year after screening, sorted least-cloudy first
-MIN_CLEAR      = 2     # minimum clear pixel observations needed to keep a composite value
-SEASON_START   = 5     # May  ─┐ peak vegetation / full leaf-out
-SEASON_END     = 9     # Sep  ─┘
+MIN_CLEAR      = 1     # minimum clear pixel observations to keep a composite value
+SEASON_START   = 4     # Apr  ─┐ extend season to maximize clear-sky coverage
+SEASON_END     = 10    # Oct  ─┘
 
 # ── Landsat band assets on Planetary Computer ─────────────────────────────────
 SR_SCALE  = 0.0000275
@@ -124,20 +161,22 @@ def load_mines(csv_path: Path) -> dict:
 # ── Raster I/O ────────────────────────────────────────────────────────────────
 
 def _reproject_band(href: str, dtype: type, nodata, grid: RasterGrid) -> np.ndarray:
-    dst = np.full((grid.height, grid.width), nodata, dtype=dtype)
-    with rasterio.open(href) as src:
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=dst,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=grid.transform,
-            dst_crs=grid.crs,
-            resampling=Resampling.bilinear if dtype == np.float32 else Resampling.nearest,
-            src_nodata=0,
-            dst_nodata=nodata,
-        )
-    return dst
+    def _do():
+        dst = np.full((grid.height, grid.width), nodata, dtype=dtype)
+        with rasterio.open(href) as src:
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=dst,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=grid.transform,
+                dst_crs=grid.crs,
+                resampling=Resampling.bilinear if dtype == np.float32 else Resampling.nearest,
+                src_nodata=0,
+                dst_nodata=nodata,
+            )
+        return dst
+    return _retry(_do)
 
 
 def read_band_to_grid(href: str, grid: RasterGrid) -> np.ndarray:
@@ -175,7 +214,8 @@ def cloud_mask(qa: np.ndarray) -> np.ndarray:
     shadow_conf = (qa >> 10) & 3
     cirrus_conf = (qa >> 14) & 3
     return (
-        ((qa & 2)  == 0) &     # dilated cloud
+        # bit 1 (dilated cloud) intentionally omitted — the 3-px dilation buffer
+        # masks too many real clear pixels in dense-cloud Appalachian terrain
         ((qa & 4)  == 0) &     # cirrus
         ((qa & 8)  == 0) &     # cloud
         ((qa & 16) == 0) &     # cloud shadow
@@ -242,21 +282,31 @@ def process_year(
 ) -> tuple[np.ndarray | None, np.ndarray | None, int, list[str]]:
     """Returns (ndvi, nbr, n_scenes, platforms). Both arrays None if no scenes found."""
     last_day = calendar.monthrange(year, SEASON_END)[1]
-    search = catalog.search(
-        collections=["landsat-c2-l2"],
-        bbox=list(bounds),
-        datetime=f"{year}-{SEASON_START:02d}-01/{year}-{SEASON_END:02d}-{last_day:02d}",
-    )
-    # Scene-level pre-filter: exclude grossly cloudy scenes and broken LS7
-    candidates = sorted(
-        (
+
+    def _search():
+        # Push cloud_cover filter and sort to the server so pagination is small
+        # and each page request returns fast.  max_items caps total items fetched
+        # client-side so we never follow more than a couple of pages.
+        search = catalog.search(
+            collections=["landsat-c2-l2"],
+            bbox=list(bounds),
+            datetime=f"{year}-{SEASON_START:02d}-01/{year}-{SEASON_END:02d}-{last_day:02d}",
+            query={"eo:cloud_cover": {"lte": CLOUD_THRESH}},
+            sortby="+properties.eo:cloud_cover",
+            limit=50,
+            max_items=MAX_SCENES * 4,
+        )
+        # Only client-side filter left: drop post-SLC-failure LS7
+        return [
             i for i in search.items()
-            if i.properties.get("eo:cloud_cover", 100) < CLOUD_THRESH
-            # LS7 scan-line corrector failed May 2003 — stripes degrade composites
-            and not (i.properties.get("platform") == "landsat-7" and year > 2003)
-        ),
-        key=lambda i: i.properties.get("eo:cloud_cover", 100),
-    )
+            if not (i.properties.get("platform") == "landsat-7" and year > 2003)
+        ]
+
+    try:
+        candidates = _retry(_search)
+    except Exception as exc:
+        tqdm.write(f"  {year}: search failed after retries ({exc}) — skipped")
+        return None, None, 0, []
 
     if not candidates:
         return None, None, 0, []
@@ -358,6 +408,10 @@ def main() -> None:
         "--mine", metavar="NAME_OR_SLUG",
         help="Process only this mine (default: all mines in mine-metadata.csv)",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing outputs and cache (skip the cached-file check)",
+    )
     args = parser.parse_args()
 
     mines = load_mines(METADATA_CSV)
@@ -403,7 +457,7 @@ def main() -> None:
             ndvi_npy = cache_dir / f"ndvi_{year}.npy"
             nbr_npy  = cache_dir / f"nbr_{year}.npy"
 
-            if ndvi_png.exists() and nbr_png.exists() and ndvi_npy.exists() and nbr_npy.exists():
+            if not args.force and ndvi_png.exists() and nbr_png.exists() and ndvi_npy.exists() and nbr_npy.exists():
                 tqdm.write(f"  {year}: cached")
                 continue
 
